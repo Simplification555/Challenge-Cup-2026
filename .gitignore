@@ -4,3 +4,6 @@ sample_outputs/
 outputs/
 *.tmp
 .DS_Store
+.venv/
+data/
+CLAUDE.md

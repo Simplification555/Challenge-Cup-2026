@@ -118,22 +118,28 @@ def build_llm_judge_config(args: argparse.Namespace) -> Optional[LLMJudgeConfig]
         judge_all=args.llm_judge_all,
     )
     # Primary judge
-    key1 = args.judge_api_key or os.environ.get("DEEPSEEK_API_KEY", "") or os.environ.get("MODEL_API_KEY", "")
-    base1 = args.judge_api_base or os.environ.get("LLM_API_BASE", "https://api.deepseek.com/chat/completions")
+    key1 = (
+        args.judge_api_key
+        or os.environ.get("INTERN_API_KEY", "")
+        or os.environ.get("DEEPSEEK_API_KEY", "")
+        or os.environ.get("MODEL_API_KEY", "")
+        or os.environ.get("OPENAI_API_KEY", "")
+    )
+    base1 = args.judge_api_base or os.environ.get("INTERN_API_BASE", "") or os.environ.get("LLM_API_BASE", "")
     if key1:
         config.add_judge(args.judge_model, key1, base1)
     # Second judge
     model2 = getattr(args, "judge_model2", None)
     if model2:
-        key2 = getattr(args, "judge_api_key2", None) or os.environ.get("MODEL2_API_KEY", "")
-        base2 = getattr(args, "judge_api_base2", None) or os.environ.get("LLM_API_BASE", "https://api.openai.com/v1/chat/completions")
+        key2 = getattr(args, "judge_api_key2", None) or os.environ.get("MODEL2_API_KEY", "") or os.environ.get("INTERN_API_KEY", "")
+        base2 = getattr(args, "judge_api_base2", None) or os.environ.get("MODEL2_API_BASE", "") or os.environ.get("INTERN_API_BASE", "") or os.environ.get("LLM_API_BASE", "")
         if key2:
             config.add_judge(model2, key2, base2)
     # Third judge
     model3 = getattr(args, "judge_model3", None)
     if model3:
-        key3 = getattr(args, "judge_api_key3", None) or os.environ.get("MODEL3_API_KEY", "")
-        base3 = getattr(args, "judge_api_base3", None) or os.environ.get("LLM_API_BASE", "https://api.openai.com/v1/chat/completions")
+        key3 = getattr(args, "judge_api_key3", None) or os.environ.get("MODEL3_API_KEY", "") or os.environ.get("INTERN_API_KEY", "")
+        base3 = getattr(args, "judge_api_base3", None) or os.environ.get("MODEL3_API_BASE", "") or os.environ.get("INTERN_API_BASE", "") or os.environ.get("LLM_API_BASE", "")
         if key3:
             config.add_judge(model3, key3, base3)
     if not config.judges:
@@ -166,7 +172,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--judge-api-key",
         type=str,
         default=None,
-        help="Judge 1 API key. Defaults to DEEPSEEK_API_KEY or MODEL_API_KEY.",
+        help="Judge 1 API key. Defaults to INTERN_API_KEY > DEEPSEEK_API_KEY > MODEL_API_KEY > OPENAI_API_KEY.",
     )
     parser.add_argument(
         "--judge-api-base",
@@ -174,7 +180,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Judge 1 API base URL.",
     )
-    parser.add_argument("--judge-model", type=str, default="deepseek-chat", help="Judge 1 model name")
+    parser.add_argument("--judge-model", type=str, default="intern-s2-preview", help="Judge 1 model name (defaults to Intern-S to match official grader)")
     parser.add_argument("--judge-timeout", type=int, default=60)
     parser.add_argument("--judge-model2", type=str, default=None, help="Judge 2 model name (optional)")
     parser.add_argument("--judge-api-key2", type=str, default=None, help="Judge 2 API key")

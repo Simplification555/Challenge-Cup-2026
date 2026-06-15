@@ -42,6 +42,51 @@ except Exception:  # noqa: BLE001 - injected-client mode should not require lage
             del add_file_handler
             self.logger = logging.getLogger(name)
 
+# lagent.utils.get_logger adds a console handler (and an optional file
+# handler) on every call, so N parallel workers end up with N handlers on
+# the same global logger → every log line is written N times. We wrap it
+# with a double-checked-locked cache keyed on (name, level) so handlers
+# are attached only on the first call per logger. We must patch both
+# `lagent.utils.get_logger` and `lagent.hooks.get_logger` because the
+# latter is `from lagent.utils import get_logger` and is the function
+# MessageLogger actually calls. No-op when lagent is not installed (the
+# stub MessageLogger above uses logging.getLogger directly and has no
+# duplication problem).
+try:
+    import threading
+    import lagent.utils as _lagent_utils
+    import lagent.hooks.logger as _lagent_hooks_logger
+    _orig_get_logger = _lagent_utils.get_logger
+    _logger_cache_lock = threading.Lock()
+    _cached_loggers: Dict[Tuple[str, str], Any] = {}
+
+    def _get_logger_once(
+        name: str = "lagent",
+        level: str = "debug",
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        key = (name, level)
+        cached = _cached_loggers.get(key)
+        if cached is not None:
+            return cached
+        with _logger_cache_lock:
+            cached = _cached_loggers.get(key)
+            if cached is None:
+                cached = _orig_get_logger(name, level, *args, **kwargs)
+                _cached_loggers[key] = cached
+        return cached
+
+    # Patch the canonical location AND the locally-bound import in
+    # lagent.hooks.logger (which is what MessageLogger actually calls).
+    _lagent_utils.get_logger = _get_logger_once
+    _lagent_hooks_logger.get_logger = _get_logger_once
+    # Do NOT `del` the helpers above — the patched function still references
+    # them via its closure cells, and removing the names from this module's
+    # globals would turn those cells into NameErrors at call time.
+except Exception:  # noqa: BLE001
+    pass
+
 from . import prompts
 from .config import SolverConfig, load_config
 from .normalizer import equivalent_answers, normalize_answer
@@ -174,6 +219,7 @@ class MathSolverAgent:
         if official_mode:
             self._config.official_mode = True
 
+        self._model_type = model_type
         self._uses_injected_client = client is not None
         if client is not None:
             self._llm = client
@@ -192,6 +238,14 @@ class MathSolverAgent:
                 temperature=temperature,
                 max_new_tokens=max_new_tokens,
             )
+            # lagent's BaseAPILLM.__init__ has a fixed kwarg allowlist, so
+            # thinking_mode can't be passed at construction. Inject it into
+            # gen_params directly — chat() merges self.gen_params into the
+            # request body, and for internlm-prefixed models every gen_param
+            # key is spread into the JSON payload (see lagent/llms/openai.py
+            # generate_request_data). Only effective for Intern-S models.
+            if self._config.thinking_mode and "intern" in model_type.lower():
+                self._llm.gen_params["thinking_mode"] = True
         self._sandbox_unavailable_reason = ""
         if self._config.enable_sandbox and MathSandbox is not None:
             self._sandbox = MathSandbox(timeout=self._config.sandbox_timeout)
@@ -200,7 +254,17 @@ class MathSolverAgent:
             if self._config.enable_sandbox:
                 self._sandbox_unavailable_reason = "MathSandbox dependencies are unavailable"
         self._memory = Memory(recent_n=30)
-        self._msg_logger = MessageLogger(name="math_prove", add_file_handler=True)
+        # Pre-create the lagent log directory so its get_logger (which has a
+        # TOCTOU race in `if not osp.exists: os.makedirs(...)`) does not raise
+        # FileExistsError when multiple parallel workers construct at once. We
+        # also disable the file handler because lagent adds it to the global
+        # logger on every call, which causes 4x duplicate writes in parallel
+        # mode. The per-problem logs at --log-dir already capture everything.
+        # Path is overridable via MATH_PROVE_LOG_DIR for Docker / sandbox runs
+        # where the default cwd-relative './log' may not be writable.
+        log_dir = os.environ.get("MATH_PROVE_LOG_DIR", "log")
+        os.makedirs(log_dir, exist_ok=True)
+        self._msg_logger = MessageLogger(name="math_prove", add_file_handler=False)
         self._temperature = temperature
         self._max_new_tokens = max_new_tokens
         self._problem_timeout = self._config.problem_timeout
@@ -212,9 +276,12 @@ class MathSolverAgent:
         model = str(model_type or "").lower()
         base = str(api_base or "").lower()
         if not str(api_key or "").strip():
-            raise RuntimeError("Official run requires OPENAI_API_KEY / Intern-S1 token.")
-        if "intern-s1" not in model:
-            raise RuntimeError("Official run must use intern-s1, intern-s1-pro, or intern-s1-mini.")
+            raise RuntimeError("Official run requires an Intern-S series API token.")
+        if "intern-s1" not in model and "intern-s2" not in model:
+            raise RuntimeError(
+                "Official run must use an Intern-S series model "
+                "(intern-s1, intern-s1-pro, intern-s1-mini, intern-s2-preview, etc.)."
+            )
         if "intern" not in base or "/chat/completions" not in base:
             raise RuntimeError(
                 "Official run must use the InternLM OpenAI-compatible chat completions endpoint."
@@ -973,19 +1040,23 @@ class MathSolverAgent:
         raise RuntimeError(f"LLM call failed after {max_retries} retries: {last_error}")
 
     def _chat(self, messages: List[Dict[str, str]]) -> Any:
+        thinking = bool(getattr(self._config, "thinking_mode", False))
+        model_is_intern_s = "intern-s" in str(getattr(self, "_model_type", "")).lower()
         if self._uses_injected_client:
+            kwargs = {
+                "messages": messages,
+                "temperature": self._temperature,
+                "max_tokens": self._max_new_tokens,
+            }
+            if thinking and model_is_intern_s:
+                kwargs["thinking_mode"] = True
             try:
-                return self._llm.chat(
-                    messages=messages,
-                    temperature=self._temperature,
-                    max_tokens=self._max_new_tokens,
-                )
+                return self._llm.chat(**kwargs)
             except TypeError:
-                return self._llm.chat(
-                    messages,
-                    temperature=self._temperature,
-                    max_tokens=self._max_new_tokens,
-                )
+                # Platform client rejected an unknown kwarg (e.g. thinking_mode);
+                # drop it and retry without the optional field.
+                kwargs.pop("thinking_mode", None)
+                return self._llm.chat(**kwargs)
         return self._llm.chat(
             messages,
             temperature=self._temperature,
