@@ -219,6 +219,7 @@ class MathSolverAgent:
         if official_mode:
             self._config.official_mode = True
 
+        self._model_type = model_type
         self._uses_injected_client = client is not None
         if client is not None:
             self._llm = client
@@ -237,6 +238,14 @@ class MathSolverAgent:
                 temperature=temperature,
                 max_new_tokens=max_new_tokens,
             )
+            # lagent's BaseAPILLM.__init__ has a fixed kwarg allowlist, so
+            # thinking_mode can't be passed at construction. Inject it into
+            # gen_params directly — chat() merges self.gen_params into the
+            # request body, and for internlm-prefixed models every gen_param
+            # key is spread into the JSON payload (see lagent/llms/openai.py
+            # generate_request_data). Only effective for Intern-S models.
+            if self._config.thinking_mode and "intern" in model_type.lower():
+                self._llm.gen_params["thinking_mode"] = True
         self._sandbox_unavailable_reason = ""
         if self._config.enable_sandbox and MathSandbox is not None:
             self._sandbox = MathSandbox(timeout=self._config.sandbox_timeout)
@@ -1031,19 +1040,23 @@ class MathSolverAgent:
         raise RuntimeError(f"LLM call failed after {max_retries} retries: {last_error}")
 
     def _chat(self, messages: List[Dict[str, str]]) -> Any:
+        thinking = bool(getattr(self._config, "thinking_mode", False))
+        model_is_intern_s = "intern-s" in str(getattr(self, "_model_type", "")).lower()
         if self._uses_injected_client:
+            kwargs = {
+                "messages": messages,
+                "temperature": self._temperature,
+                "max_tokens": self._max_new_tokens,
+            }
+            if thinking and model_is_intern_s:
+                kwargs["thinking_mode"] = True
             try:
-                return self._llm.chat(
-                    messages=messages,
-                    temperature=self._temperature,
-                    max_tokens=self._max_new_tokens,
-                )
+                return self._llm.chat(**kwargs)
             except TypeError:
-                return self._llm.chat(
-                    messages,
-                    temperature=self._temperature,
-                    max_tokens=self._max_new_tokens,
-                )
+                # Platform client rejected an unknown kwarg (e.g. thinking_mode);
+                # drop it and retry without the optional field.
+                kwargs.pop("thinking_mode", None)
+                return self._llm.chat(**kwargs)
         return self._llm.chat(
             messages,
             temperature=self._temperature,

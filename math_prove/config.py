@@ -31,6 +31,14 @@ class SolverConfig:
     extract_must_match_candidate: bool = True
     official_mode: bool = False
     force_max_attempts: Optional[int] = None
+    thinking_mode: bool = False
+
+    def __post_init__(self) -> None:
+        # Intern-S thinking mode emits longer reasoning chains; raise the
+        # per-problem timeout floor to avoid spurious fallback. Users who set
+        # an even higher timeout keep their value.
+        if self.thinking_mode and self.problem_timeout < 480.0:
+            self.problem_timeout = 480.0
 
     def attempts_for(self, difficulty: str) -> int:
         if self.force_max_attempts is not None:
@@ -84,6 +92,13 @@ SAFE_PLUS_PRESET: Dict[str, Any] = {
     "enable_equivalence_check": True,
     "enable_extract_stage": True,
     "enable_candidate_selection": True,
+}
+
+SAFE_THINKING_PRESET: Dict[str, Any] = {
+    **SAFE_PRESET,
+    "official_mode": True,
+    "thinking_mode": True,
+    # problem_timeout is auto-bumped to 480s by SolverConfig.__post_init__.
 }
 
 STRONG_PRESET: Dict[str, Any] = {
@@ -149,6 +164,7 @@ ABLATION_PRESETS: Dict[str, Dict[str, Any]] = {
         **SAFE_PRESET,
         "official_mode": True,
     },
+    "safe_thinking": SAFE_THINKING_PRESET,
     "no_sandbox": {"enable_sandbox": False, "enable_ortools": False},
     "no_ortools": {"enable_ortools": False},
     "no_normalizer": {"enable_normalizer": False, "enable_equivalence_check": False},
