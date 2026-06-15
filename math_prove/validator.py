@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -54,6 +55,7 @@ class ValidationItem:
     llm_judge_confidence: Optional[float] = None
     llm_judge_reason: str = ""
     llm_judge_method: str = ""
+    llm_judge_voting_detail: Optional[Dict[str, Any]] = None
     issues: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -141,7 +143,7 @@ class _GenericLLM:
             "messages": messages,
             "n": 1,
             "temperature": 0.0,
-            "max_tokens": 512,
+            "max_tokens": 2048,
             "response_format": {"type": "json_object"},
         }
         headers = {
@@ -167,7 +169,7 @@ class _GenericLLM:
             "messages": messages,
             "n": 1,
             "temperature": 0.0,
-            "max_tokens": 512,
+            "max_tokens": 2048,
         }
         headers = {
             "Content-Type": "application/json",
@@ -183,14 +185,18 @@ class _GenericLLM:
 
 
 JUDGE_SYSTEM_PROMPT = (
-    "You are a strict mathematical answer judge. Given a math problem and a "
-    "proposed answer, determine whether the answer is mathematically correct. "
-    "For proof problems: check whether the answer states the correct conclusion. "
-    "Ignore superficial formatting (LaTeX vs plain text, bracket styles, "
-    "whitespace, Unicode). Do not penalize the answer for being concise — a "
-    "one-sentence conclusion is acceptable even for a proof problem, as long "
-    "as it correctly identifies what was to be proved. "
-    "Return only JSON with keys: correct, confidence, reason."
+    "You are a math grader for the Intern-S math reasoning challenge.\n\n"
+    "You receive:\n"
+    "1. problem — the math problem statement\n"
+    "2. reference_answer — ground truth; may be a final expression, a numeric value, or a proof/solution sketch\n"
+    "3. candidate_final_answer — the agent's submitted final answer\n"
+    "4. candidate_solution_process — the agent's reasoning_summary, key_steps, and learning_hint\n\n"
+    "Grade strictly. Consider:\n"
+    "- Is the candidate's final answer mathematically equivalent to the reference?\n"
+    "- Is the solution process logically valid and consistent with the final answer?\n"
+    "- For proof problems: does the reasoning actually establish the claim, or merely restate it?\n\n"
+    "Be lenient on superficial formatting (LaTeX vs plain text, bracket styles, whitespace, Unicode).\n\n"
+    "Return JSON only with keys: correct (bool), confidence (0.0-1.0), reason (string, ≤500 chars)."
 )
 
 
@@ -316,6 +322,11 @@ def validate_results(
                 )
 
             if llm_judge and llm_judge.enabled:
+                solution_process = {
+                    "reasoning_summary": str(solution.reasoning_summary or ""),
+                    "key_steps": [str(s) for s in (solution.key_steps or [])],
+                    "learning_hint": str(solution.learning_hint or ""),
+                }
                 judge = judge_answer_with_llm(
                     problem=str(exp.get("problem_text") or exp.get("question") or exp.get("problem") or ""),
                     prediction=solution.answer,
@@ -323,11 +334,13 @@ def validate_results(
                     answer_type=answer_type,
                     config=llm_judge,
                     local_equivalent=eq.equivalent,
+                    solution_process=solution_process,
                 )
                 item.llm_judge_correct = judge.get("correct")
                 item.llm_judge_confidence = judge.get("confidence")
                 item.llm_judge_reason = judge.get("reason", "")
                 item.llm_judge_method = judge.get("method", "")
+                item.llm_judge_voting_detail = judge.get("voting_detail")
                 if item.llm_judge_correct is not None:
                     report.llm_judge_checked += 1
                     if item.llm_judge_correct:
@@ -353,37 +366,53 @@ def validate_results(
 def _call_one_judge(
     problem: str,
     prediction: Any,
+    expected_answer: Any,
+    solution_process: Optional[Dict[str, Any]],
     llm: _GenericLLM,
 ) -> Optional[Dict[str, Any]]:
-    """Call a single judge model, returning its verdict or None on error."""
-    try:
-        messages = [
-            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "problem": problem,
-                        "answer": str(prediction or ""),
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ]
-        raw = llm.chat(messages)
-        parsed = _parse_judge_json(raw)
-        return {
-            "correct": bool(parsed.get("correct")),
-            "confidence": _clamp_float(parsed.get("confidence", 0.0)),
-            "reason": str(parsed.get("reason", ""))[:500],
-        }
-    except Exception as exc:
-        return None
+    """Call a single judge model, returning its verdict or None on error.
+
+    Retries up to 3 times with exponential backoff on transient failures
+    (network/timeout/JSON parse). The judge sees the problem, reference answer,
+    candidate's final answer, and candidate's solution process.
+    """
+    messages = [
+        {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "problem": problem,
+                    "reference_answer": str(expected_answer or ""),
+                    "candidate_final_answer": str(prediction or ""),
+                    "candidate_solution_process": solution_process or {},
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            raw = llm.chat(messages)
+            parsed = _parse_judge_json(raw)
+            return {
+                "correct": bool(parsed.get("correct")),
+                "confidence": _clamp_float(parsed.get("confidence", 0.0)),
+                "reason": str(parsed.get("reason", ""))[:500],
+            }
+        except Exception as exc:
+            last_err = exc
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    return None
 
 
 def _multi_judge(
     problem: str,
     prediction: Any,
+    expected_answer: Any,
+    solution_process: Optional[Dict[str, Any]],
     config: LLMJudgeConfig,
     local_equivalent: bool = False,
 ) -> Dict[str, Any]:
@@ -411,7 +440,7 @@ def _multi_judge(
 
     results: List[Optional[Dict[str, Any]]] = []
     for llm in llms:
-        results.append(_call_one_judge(problem, prediction, llm))
+        results.append(_call_one_judge(problem, prediction, expected_answer, solution_process, llm))
 
     correct_votes = sum(1 for r in results if r is not None and r["correct"])
     valid = sum(1 for r in results if r is not None)
@@ -452,8 +481,9 @@ def judge_answer_with_llm(
     answer_type: str,
     config: LLMJudgeConfig,
     local_equivalent: bool = False,
+    solution_process: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return _multi_judge(problem, prediction, config, local_equivalent)
+    return _multi_judge(problem, prediction, expected, solution_process, config, local_equivalent)
 
 
 def _parse_judge_json(text: str) -> Dict[str, Any]:
