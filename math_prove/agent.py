@@ -245,13 +245,16 @@ class MathSolverAgent:
             if self._config.enable_sandbox:
                 self._sandbox_unavailable_reason = "MathSandbox dependencies are unavailable"
         self._memory = Memory(recent_n=30)
-        # Pre-create ./log so lagent's get_logger (which has a TOCTOU race in
-        # `if not osp.exists: os.makedirs(...)`) does not raise FileExistsError
-        # when multiple parallel workers construct simultaneously. We also
-        # disable the file handler because lagent adds it to the global logger
-        # on every call, which causes 4x duplicate writes in parallel mode.
-        # The per-problem logs at --log-dir already capture everything.
-        os.makedirs("log", exist_ok=True)
+        # Pre-create the lagent log directory so its get_logger (which has a
+        # TOCTOU race in `if not osp.exists: os.makedirs(...)`) does not raise
+        # FileExistsError when multiple parallel workers construct at once. We
+        # also disable the file handler because lagent adds it to the global
+        # logger on every call, which causes 4x duplicate writes in parallel
+        # mode. The per-problem logs at --log-dir already capture everything.
+        # Path is overridable via MATH_PROVE_LOG_DIR for Docker / sandbox runs
+        # where the default cwd-relative './log' may not be writable.
+        log_dir = os.environ.get("MATH_PROVE_LOG_DIR", "log")
+        os.makedirs(log_dir, exist_ok=True)
         self._msg_logger = MessageLogger(name="math_prove", add_file_handler=False)
         self._temperature = temperature
         self._max_new_tokens = max_new_tokens
