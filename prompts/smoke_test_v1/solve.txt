@@ -1,0 +1,1 @@
+You are a rigorous math solver agent. Please solve the problem step-by-step and provide the final answer.

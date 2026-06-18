@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .main import run_batch
+from .run_utils import unique_run_dir
 from .validator import LLMJudgeConfig, validate_results, write_validation_report
 
 
@@ -22,6 +23,7 @@ def run_validation_only(
     log_dir: Optional[str] = None,
     strict_expected_ids: bool = True,
     llm_judge: Optional[LLMJudgeConfig] = None,
+    print_full_report: bool = False,
 ) -> None:
     validation = validate_results(
         results,
@@ -32,15 +34,25 @@ def run_validation_only(
     )
     write_validation_report(validation, report)
     payload = validation.to_dict()
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    if print_full_report:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
     print_score_summary(payload)
     print(f"Validation report saved to {report}")
 
 
 def run_regression(args: argparse.Namespace) -> None:
     expected = str(Path(args.expected or DEFAULT_EXPECTED))
-    output_root = Path(args.output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
+    if args.output_dir:
+        output_root = Path(args.output_dir)
+        if output_root.exists() and any(output_root.iterdir()) and not args.resume:
+            output_root = unique_run_dir(output_root.parent, output_root.name)
+        else:
+            output_root.mkdir(parents=True, exist_ok=True)
+    else:
+        output_root = unique_run_dir(
+            args.run_root,
+            args.run_name or f"regression_{Path(expected).stem}",
+        )
 
     api_key = args.api_key or os.environ.get("OPENAI_API_KEY")
     api_base = args.api_base or os.environ.get("LLM_API_BASE")
@@ -95,15 +107,23 @@ def run_regression(args: argparse.Namespace) -> None:
 
 
 def print_score_summary(row: dict, prefix: str = "") -> None:
-    accuracy = row.get("answer_accuracy")
+    accuracy = row.get("local_equivalence_accuracy", row.get("answer_accuracy"))
     accuracy_text = "n/a" if accuracy is None else f"{accuracy:.2%}"
     judge_accuracy = row.get("llm_judge_accuracy")
     judge_text = "" if judge_accuracy is None else f" | llm_judge={judge_accuracy:.2%}"
+    official_like_accuracy = row.get("official_like_accuracy")
+    official_like_text = (
+        "n/a" if official_like_accuracy is None else f"{official_like_accuracy:.2%}"
+    )
+    official_like_source = row.get("official_like_accuracy_source", "unknown")
     schema_rate = row.get("schema_valid_rate", 0.0)
     print(
-        f"{prefix}Accuracy={accuracy_text} "
+        f"{prefix}local_equivalence={accuracy_text} "
         f"({row.get('answer_correct', 0)}/{row.get('answer_checked', 0)} checked) | "
+        f"official_like={official_like_text} "
+        f"({row.get('official_like_correct', 0)}/{row.get('official_like_checked', 0)} via {official_like_source}) | "
         f"schema_valid={schema_rate:.2%} | "
+        f"needs_llm_judge={row.get('needs_llm_judge_count', 0)} | "
         f"preflight_issues={row.get('preflight_issue_count', 0)}"
         f"{judge_text}"
     )
@@ -125,7 +145,7 @@ def build_llm_judge_config(args: argparse.Namespace) -> Optional[LLMJudgeConfig]
         or os.environ.get("MODEL_API_KEY", "")
         or os.environ.get("OPENAI_API_KEY", "")
     )
-    base1 = args.judge_api_base or os.environ.get("INTERN_API_BASE", "") or os.environ.get("LLM_API_BASE", "")
+    base1 = args.judge_api_base or _default_judge_api_base(args.judge_model)
     if key1:
         config.add_judge(args.judge_model, key1, base1)
     # Second judge
@@ -153,6 +173,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected", type=str, default=str(DEFAULT_EXPECTED), help="Expected-answer JSONL")
     parser.add_argument("--report", type=str, default="outputs/validation_report.json")
     parser.add_argument("--log-dir", type=str, default=None, help="Per-problem log directory to check")
+    parser.add_argument(
+        "--print-full-report",
+        action="store_true",
+        help="Print every validation item to stdout. By default, details are only written to --report.",
+    )
     parser.add_argument(
         "--ignore-missing-expected",
         action="store_true",
@@ -189,7 +214,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--judge-api-key3", type=str, default=None, help="Judge 3 API key")
     parser.add_argument("--judge-api-base3", type=str, default=None, help="Judge 3 API base URL")
     parser.add_argument("--run", action="store_true", help="Run the solver before validating")
-    parser.add_argument("--output-dir", type=str, default="outputs/regression")
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--run-root", type=str, default="outputs/regression")
+    parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
     parser.add_argument("--api-key", type=str, default=None)
     parser.add_argument("--api-base", type=str, default=None)
@@ -203,6 +230,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Comma-separated presets, e.g. full,single_candidate,no_normalizer",
     )
     return parser
+
+
+def _default_judge_api_base(model: str) -> str:
+    if os.environ.get("INTERN_API_BASE"):
+        return os.environ["INTERN_API_BASE"]
+    if os.environ.get("LLM_API_BASE"):
+        return os.environ["LLM_API_BASE"]
+    if str(model or "").lower().startswith("deepseek"):
+        return "https://api.deepseek.com/chat/completions"
+    return ""
 
 
 def main() -> None:
@@ -220,6 +257,7 @@ def main() -> None:
         args.log_dir,
         strict_expected_ids=not args.ignore_missing_expected,
         llm_judge=build_llm_judge_config(args),
+        print_full_report=args.print_full_report,
     )
 
 

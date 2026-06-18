@@ -25,6 +25,7 @@ from .main import (
     load_problems,
 )
 from .parser import fallback_solution, solution_to_json
+from .run_utils import find_default_input, plan_batch_paths
 
 
 def _safe_print(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
@@ -75,6 +76,7 @@ class RateLimitedAgent:
         config_path: Optional[str],
         ablation: str,
         official_mode: bool,
+        prompt_overrides: Optional[Dict[str, Optional[str]]] = None,
     ) -> None:
         from .agent import MathSolverAgent
 
@@ -85,6 +87,7 @@ class RateLimitedAgent:
             config_path=config_path,
             ablation=ablation,
             official_mode=official_mode,
+            prompt_overrides=prompt_overrides,
         )
         self._limiter = limiter
         original_call_llm = self._agent._call_llm
@@ -108,7 +111,7 @@ class RateLimitedAgent:
 
 def run_parallel_batch(
     input_path: str,
-    output_path: str,
+    output_path: Optional[str] = None,
     model_type: str = "intern-s1",
     api_key: Optional[str] = None,
     api_base: Optional[str] = None,
@@ -123,13 +126,24 @@ def run_parallel_batch(
     workers: int = 3,
     rpm_limit: int = 80,
     dry_run: bool = False,
+    run_root: str = "outputs/parallel_runs",
+    run_name: Optional[str] = None,
+    prompt_overrides: Optional[Dict[str, Optional[str]]] = None,
 ) -> Dict[str, Any]:
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    results_json = Path(results_json_path) if results_json_path else output.with_suffix(".json")
-    logs = Path(log_dir) if log_dir else output.parent / "logs"
-    summary = Path(summary_path) if summary_path else output.parent / "run_summary.json"
-    logs.mkdir(parents=True, exist_ok=True)
+    planned = plan_batch_paths(
+        input_path,
+        output_path,
+        run_root=run_root,
+        run_name=run_name or f"{Path(input_path).stem}_{ablation}_parallel",
+        results_json_path=results_json_path,
+        log_dir=log_dir,
+        summary_path=summary_path,
+        resume=resume,
+    )
+    output = planned["output_jsonl"]
+    results_json = planned["results_json"]
+    logs = planned["log_dir"]
+    summary = planned["summary"]
 
     problems = load_problems(input_path)
     if limit is not None:
@@ -185,6 +199,7 @@ def run_parallel_batch(
             config_path=config_path,
             ablation=ablation,
             official_mode=official_mode,
+            prompt_overrides=prompt_overrides,
         )
         try:
             solution = agent.solve(text, pid, raw_metadata=metadata)
@@ -276,8 +291,10 @@ def run_parallel_batch(
         "fallback_or_unpassed_count_this_run": fallback_count,
         "config_path": config_path,
         "ablation": ablation,
+        "run_dir": str(planned["run_dir"]),
         "workers": workers,
         "rpm_limit": rpm_limit,
+        "prompt_overrides": prompt_overrides,
         "elapsed_seconds": round(time.time() - started_at, 3),
     }
     summary.write_text(json.dumps(run_summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -295,8 +312,10 @@ def run_parallel_batch(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Parallel MathSolve-Agent batch runner")
-    parser.add_argument("--input", "-i", required=True, help="Input JSON/JSONL/CSV/XLSX")
-    parser.add_argument("--output", "-o", default="outputs/parallel/results.jsonl")
+    parser.add_argument("--input", "-i", default=None, help="Input JSON/JSONL/CSV/XLSX")
+    parser.add_argument("--output", "-o", default=None)
+    parser.add_argument("--run-root", default="outputs/parallel_runs")
+    parser.add_argument("--run-name", default=None)
     parser.add_argument("--results-json", default=None)
     parser.add_argument("--log-dir", default=None)
     parser.add_argument("--summary", default=None)
@@ -318,8 +337,9 @@ def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
     api_key, api_base = _resolve_api_config(args)
+    input_path = args.input or str(find_default_input())
     run_parallel_batch(
-        input_path=args.input,
+        input_path=input_path,
         output_path=args.output,
         model_type=args.model,
         api_key=api_key,
@@ -335,6 +355,8 @@ def main() -> None:
         workers=args.workers,
         rpm_limit=args.rpm_limit,
         dry_run=args.dry_run,
+        run_root=args.run_root,
+        run_name=args.run_name,
     )
 
 

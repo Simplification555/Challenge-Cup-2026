@@ -207,6 +207,7 @@ class MathSolverAgent:
         config_path: Optional[str] = None,
         ablation: str = "full",
         official_mode: bool = False,
+        prompt_overrides: Optional[Dict[str, Optional[str]]] = None,
     ) -> None:
         self._config = config or load_config(config_path, ablation)
         if config is None and config_path is None:
@@ -218,6 +219,7 @@ class MathSolverAgent:
                 self._config.confidence_threshold = confidence_threshold
         if official_mode:
             self._config.official_mode = True
+        self._prompt_overrides = dict(prompt_overrides) if prompt_overrides else {}
 
         self._model_type = model_type
         self._uses_injected_client = client is not None
@@ -309,7 +311,7 @@ class MathSolverAgent:
             "api_status": "success",
             "latency_seconds": 0.0,
             "final_json": {},
-            "config": self._config.to_dict(),
+            "config": {**self._config.to_dict(), "prompt_overrides": self._prompt_overrides},
         }
         self.last_run_log = run_log
         self._memory = Memory(recent_n=30)
@@ -401,6 +403,7 @@ class MathSolverAgent:
         messages = prompts.classification_messages(
             problem,
             rule_prior=rule_prior.model_dump(mode="json"),
+            variant_overrides=self._prompt_overrides,
         )
         try:
             raw = self._call_stage("classify_and_plan", messages, run_log)
@@ -586,6 +589,7 @@ class MathSolverAgent:
             classification=classification.model_dump(mode="json"),
             attempt=attempt,
             previous_feedback=previous_feedback,
+            variant_overrides=self._prompt_overrides,
         )
         raw = self._call_stage(f"solve_candidate_{attempt}", messages, run_log)
         candidate = self._parse_or_fix(
@@ -613,6 +617,7 @@ class MathSolverAgent:
             classification=classification.model_dump(mode="json"),
             candidate=candidate.model_dump(mode="json"),
             tool_result=tool_result,
+            variant_overrides=self._prompt_overrides,
         )
         if not self._config.enable_llm_verify:
             has_judgeable_answer = bool(
@@ -737,6 +742,7 @@ class MathSolverAgent:
             problem=problem,
             classification=classification.model_dump(mode="json"),
             candidates=run_log["candidates"],
+            variant_overrides=self._prompt_overrides,
         )
         try:
             raw = self._call_stage("select_best_candidate", messages, run_log)
@@ -777,6 +783,7 @@ class MathSolverAgent:
             classification=classification.model_dump(mode="json"),
             candidate=candidate.model_dump(mode="json"),
             verification=verification.model_dump(mode="json"),
+            variant_overrides=self._prompt_overrides,
         )
         try:
             raw = self._call_stage("extract_answer", messages, run_log)

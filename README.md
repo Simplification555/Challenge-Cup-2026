@@ -222,6 +222,45 @@ export INTERN_API_KEY="sk-..."
 python main.py --input_file sample_data/dev.jsonl --output_dir sample_outputs
 ```
 
+如果只想快速自测，也可以省略输入和输出目录。脚本会自动寻找默认样例数据，并把结果写入一个不会覆盖旧结果的时间戳目录：
+
+```bash
+python main.py
+```
+
+完整 MathSolve-Agent 批量入口也支持自动规划输出：
+
+```bash
+python -m math_prove.main \
+  --input data/interns1_math_18domains_504.json \
+  --model intern-s2-preview \
+  --ablation official_stable
+```
+
+如果不传 `--output`，结果会进入 `outputs/runs/<timestamp>_<dataset>_<ablation>/`，其中包含 `results.jsonl`、`results.json`、`logs/` 和 `run_summary.json`。
+
+Prompt 版本批量实验使用目录约定。每个版本放在 `prompts/<variant>/`，可包含以下 5 个文件：
+
+```text
+classify.txt
+solve.txt
+verify.txt
+select.txt
+extract.txt
+```
+
+空文件或缺失文件会回退到默认 prompt。运行多个版本：
+
+```bash
+python -m math_prove.run_prompt_sweep \
+  --input data/interns1_math_18domains_504.json \
+  --variants v1_baseline,v2_strict \
+  --model intern-s2-preview \
+  --ablation official_stable
+```
+
+如果不传 `--output-dir`，结果会进入 `outputs/prompt_sweeps/<timestamp>_prompt_sweep_<dataset>/`，每个版本独立子目录，根目录包含 `sweep_summary.json`。
+
 本地 runner 默认并发数为 8。如需调整：
 
 ```bash
@@ -283,6 +322,37 @@ https://internlm.intern-ai.org.cn/api
 ```
 
 建议选手本地调试时也使用同一份 API 控制台，避免本地实验环境和正式评分环境之间产生模型行为、接口格式或网关策略差异。
+
+## 赛事规则与常见问答 (FAQ)
+
+为了帮助参赛队伍更好地理解《挑战杯》报名、组队以及作品提交的相关规则，特整理如下常见问题解答：
+
+### 1. 赛程安排与作品提交时间
+*   **组队报名时间**：2026/05/30 - 2026/06/30。参赛选手须登录“挑战杯”官网报名并上传学校盖公章的报名表，完成校级及发榜单位审核，逾期系统将自动关闭。
+*   **作品提交时间**：2026/05/30 - 2026/09/04（初赛最晚提交截止时间为 2026-09-04 23:59）。建议至少提前 1 周完成提交，避免临近截止时间集中提交导致队列拥堵或失败。
+*   **初赛评审时间**：2026/09/20 之前完成初审，确定入围终审擂台赛的晋级名单。
+*   **终审擂台赛时间**：预计在 2026 年 11 月举行。
+
+### 2. 参赛资格与人员限制
+*   **已毕业学生能否参赛？**
+    *   **已毕业学生不可参赛**。
+    *   **2026年全日制毕业班学生**（专科生、本科生、硕士和博士研究生）可以参赛（以 2026 年 6 月 1 日以前正式注册的在校生身份为准）。
+*   **国籍与学校限制**
+    *   本赛题面向国内全日制非成人教育的普通高等学校在校专科生、本科生、硕士和博士研究生（不含在职研究生）。
+    *   **留学生与港澳台地区在校学生可以参赛**，但所有参赛作品的申报主体/参赛主体必须为国内的高等院校或科研院所，不得以境外高校或科研院所名义申报。
+*   **跨校/跨地域组队**
+    *   可以跨专业、跨学校、跨单位、跨地域组队，但同一团队的所有成员均应符合相关年龄和身份要求。
+    *   每件作品只能由 **1 所**高等院校或科研院所作为参赛主体进行申报。
+*   **团队规模限制**
+    *   每个参赛团队人数不超过 **10 人**。
+    *   每件作品的指导教师不超过 **3 人**。
+
+### 3. 评测与排名展示
+*   **在线评测系统的实时排名会每天公开吗？**
+    *   在线评测系统正式上线后，榜单会**实时更新**。
+    *   评测系统上线前，如果通过邮件等方式进行临时评测，不保证按天更新排名。
+
+---
 
 ## 提交方式
 

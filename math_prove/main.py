@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .parser import MathSolution, fallback_solution, parse_and_validate, solution_to_json
+from .run_utils import find_default_input, plan_batch_paths
 
 
 ID_FIELDS = ("problem_id", "id", "question_id", "qid", "uid", "index")
@@ -73,7 +74,7 @@ def run_single_demo(
 
 def run_batch(
     input_path: str,
-    output_path: str,
+    output_path: Optional[str] = None,
     model_type: str = "gpt-4o-mini",
     api_key: Optional[str] = None,
     api_base: Optional[str] = None,
@@ -85,16 +86,26 @@ def run_batch(
     config_path: Optional[str] = None,
     ablation: str = "full",
     official_mode: bool = False,
+    run_root: str = "outputs/runs",
+    run_name: Optional[str] = None,
+    prompt_overrides: Optional[Dict[str, Optional[str]]] = None,
 ) -> Dict[str, Any]:
     from .agent import MathSolverAgent
 
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-
-    results_json = Path(results_json_path) if results_json_path else output.with_suffix(".json")
-    logs = Path(log_dir) if log_dir else output.parent / "logs"
-    summary = Path(summary_path) if summary_path else output.parent / "run_summary.json"
-    logs.mkdir(parents=True, exist_ok=True)
+    planned = plan_batch_paths(
+        input_path,
+        output_path,
+        run_root=run_root,
+        run_name=run_name or f"{Path(input_path).stem}_{ablation}",
+        results_json_path=results_json_path,
+        log_dir=log_dir,
+        summary_path=summary_path,
+        resume=resume,
+    )
+    output = planned["output_jsonl"]
+    results_json = planned["results_json"]
+    logs = planned["log_dir"]
+    summary = planned["summary"]
 
     problems = load_problems(input_path)
     if limit is not None:
@@ -105,14 +116,6 @@ def run_batch(
         existing_results = _read_existing_results(output)
 
     mode = "a" if resume and output.exists() else "w"
-    agent = MathSolverAgent(
-        model_type=model_type,
-        api_key=api_key,
-        api_base=api_base,
-        config_path=config_path,
-        ablation=ablation,
-        official_mode=official_mode,
-    )
 
     total = len(problems)
     processed = 0
@@ -123,6 +126,18 @@ def run_batch(
     print(f"Loaded {total} problems from {input_path}")
     print(f"Writing JSONL to {output}")
     print(f"Writing per-problem logs to {logs}")
+
+    agent: Optional[MathSolverAgent] = None
+    if total > 0:
+        agent = MathSolverAgent(
+            model_type=model_type,
+            api_key=api_key,
+            api_base=api_base,
+            config_path=config_path,
+            ablation=ablation,
+            official_mode=official_mode,
+            prompt_overrides=prompt_overrides,
+        )
 
     with output.open(mode, encoding="utf-8") as f_out:
         for index, record in enumerate(problems, start=1):
@@ -139,6 +154,8 @@ def run_batch(
             item_start = time.time()
             used_exception_fallback = False
             try:
+                if agent is None:
+                    raise RuntimeError("Internal error: agent is not initialized for non-empty batch")
                 solution = agent.solve(text, pid, raw_metadata=metadata)
                 run_log = dict(agent.last_run_log)
             except Exception as exc:
@@ -193,7 +210,9 @@ def run_batch(
         "fallback_or_unpassed_count_this_run": fallback_count,
         "config_path": config_path,
         "ablation": ablation,
+        "run_dir": str(planned["run_dir"]),
         "elapsed_seconds": round(time.time() - started_at, 3),
+        "prompt_overrides": prompt_overrides,
     }
     summary.write_text(json.dumps(run_summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -370,9 +389,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--output",
         "-o",
         type=str,
-        default="outputs/results.jsonl",
-        help="Incremental JSONL output path",
+        default=None,
+        help="Incremental JSONL output path. If omitted, a unique run directory is created.",
     )
+    parser.add_argument("--run-root", type=str, default="outputs/runs", help="Root for auto run dirs")
+    parser.add_argument("--run-name", type=str, default=None, help="Optional name for auto run dirs")
     parser.add_argument("--results-json", type=str, default=None, help="Merged JSON array output")
     parser.add_argument("--log-dir", type=str, default=None, help="Per-problem log directory")
     parser.add_argument("--summary", type=str, default=None, help="Run summary JSON path")
@@ -406,7 +427,7 @@ def main() -> None:
     args = parser.parse_args()
     api_key, api_base = _resolve_api_config(args)
 
-    if args.demo or not args.input:
+    if args.demo:
         run_single_demo(
             args.model,
             api_key,
@@ -417,8 +438,10 @@ def main() -> None:
         )
         return
 
+    input_path = args.input or str(find_default_input())
+
     run_batch(
-        input_path=args.input,
+        input_path=input_path,
         output_path=args.output,
         model_type=args.model,
         api_key=api_key,
@@ -431,6 +454,8 @@ def main() -> None:
         config_path=args.config,
         ablation=args.ablation,
         official_mode=args.official,
+        run_root=args.run_root,
+        run_name=args.run_name,
     )
 
 

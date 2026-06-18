@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from .main import load_problems
+from .run_utils import find_default_input, plan_batch_paths
 
 
 DEFAULT_API_BASE = "https://chat.intern-ai.org.cn/api/v1/chat/completions"
@@ -70,32 +71,40 @@ PROMPTS: Dict[str, Dict[str, str]] = {
 
 def run_baseline(
     input_path: str,
-    output_path: str,
+    output_path: Optional[str] = None,
     model: str = "intern-s1",
     api_key: Optional[str] = None,
     api_base: Optional[str] = None,
     prompt_name: str = "baseline_v0",
+    prompt_file: Optional[str] = None,
     log_dir: Optional[str] = None,
     limit: Optional[int] = None,
     resume: bool = False,
     timeout: int = 120,
     max_retries: int = 3,
     temperature: float = 0.0,
+    run_root: str = "outputs/prompt_runs",
+    run_name: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if prompt_name not in PROMPTS:
-        known = ", ".join(sorted(PROMPTS))
-        raise ValueError(f"Unknown prompt '{prompt_name}'. Known prompts: {known}")
+    prompt = load_prompt_definition(prompt_name, prompt_file)
+    prompt_label = prompt.get("name") or (Path(prompt_file).stem if prompt_file else prompt_name)
 
     api_key = api_key or os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY or --api-key is required.")
     endpoint = normalize_chat_endpoint(api_base or os.environ.get("LLM_API_BASE") or DEFAULT_API_BASE)
 
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    logs = Path(log_dir) if log_dir else output.parent / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    summary_path = output.parent / "run_summary.json"
+    planned = plan_batch_paths(
+        input_path,
+        output_path,
+        run_root=run_root,
+        run_name=run_name or f"{Path(input_path).stem}_{prompt_label}",
+        log_dir=log_dir,
+        resume=resume,
+    )
+    output = planned["output_jsonl"]
+    logs = planned["log_dir"]
+    summary_path = planned["summary"]
 
     problems = load_problems(input_path)
     if limit is not None:
@@ -114,7 +123,7 @@ def run_baseline(
     print(f"Loaded {len(problems)} problems from {input_path}")
     print(f"Writing JSONL to {output}")
     print(f"Writing per-problem logs to {logs}")
-    print(f"Prompt: {prompt_name}")
+    print(f"Prompt: {prompt_label}")
 
     with output.open(mode, encoding="utf-8") as handle:
         for index, record in enumerate(problems, start=1):
@@ -133,7 +142,7 @@ def run_baseline(
                     pid=pid,
                     problem_text=problem_text,
                     raw_metadata=raw_metadata,
-                    prompt_name=prompt_name,
+                    prompt_name=prompt_label,
                     messages=[],
                     model=model,
                     raw_response="",
@@ -149,7 +158,7 @@ def run_baseline(
 
             print(f"[{index}/{len(problems)}] baseline solving {pid} ...")
             item_start = time.time()
-            messages = build_messages(prompt_name, problem_text)
+            messages = build_messages(prompt, problem_text)
 
             try:
                 raw_response = call_chat_completion(
@@ -179,7 +188,7 @@ def run_baseline(
                 "problem_id": pid,
                 "answer": answer,
                 "raw_response": raw_response,
-                "prompt_name": prompt_name,
+                "prompt_name": prompt_label,
                 "latency_seconds": latency,
                 "api_status": status,
             }
@@ -190,7 +199,7 @@ def run_baseline(
                 pid=pid,
                 problem_text=problem_text,
                 raw_metadata=raw_metadata,
-                prompt_name=prompt_name,
+                prompt_name=prompt_label,
                 messages=messages,
                 model=model,
                 raw_response=raw_response,
@@ -210,7 +219,9 @@ def run_baseline(
         "log_dir": str(logs),
         "model": model,
         "api_base": endpoint,
-        "prompt_name": prompt_name,
+        "prompt_name": prompt_label,
+        "prompt_file": prompt_file,
+        "run_dir": str(planned["run_dir"]),
         "total_loaded": len(problems),
         "processed_this_run": processed,
         "skipped_by_resume": skipped_resume,
@@ -229,11 +240,46 @@ def run_baseline(
     return summary
 
 
-def build_messages(prompt_name: str, problem: str) -> List[Dict[str, str]]:
-    prompt = PROMPTS[prompt_name]
+def load_prompt_definition(prompt_name: str, prompt_file: Optional[str] = None) -> Dict[str, str]:
+    if prompt_file:
+        path = Path(prompt_file)
+        text = path.read_text(encoding="utf-8")
+        if path.suffix.lower() == ".json":
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                raise ValueError("Prompt JSON must be an object.")
+            system = str(data.get("system") or data.get("system_prompt") or "").strip()
+            user = str(data.get("user") or data.get("user_prompt") or data.get("template") or "").strip()
+            name = str(data.get("name") or path.stem).strip()
+        else:
+            system = (
+                "You are a rigorous mathematical problem-solving agent. "
+                "Give a correct, complete, and judgeable final answer."
+            )
+            user = text.strip()
+            name = path.stem
+        if "{problem}" not in user:
+            user = user.rstrip() + "\n\nProblem:\n{problem}"
+        return {"name": name, "system": system, "user": user}
+
+    if prompt_name not in PROMPTS:
+        known = ", ".join(sorted(PROMPTS))
+        raise ValueError(f"Unknown prompt '{prompt_name}'. Known prompts: {known}")
+    prompt = dict(PROMPTS[prompt_name])
+    prompt["name"] = prompt_name
+    return prompt
+
+
+def render_prompt_template(template: str, problem: str) -> str:
+    """Replace only the problem placeholder so JSON braces remain literal."""
+
+    return str(template).replace("{problem}", problem)
+
+
+def build_messages(prompt: Dict[str, str], problem: str) -> List[Dict[str, str]]:
     return [
         {"role": "system", "content": prompt["system"]},
-        {"role": "user", "content": prompt["user"].format(problem=problem)},
+        {"role": "user", "content": render_prompt_template(prompt["user"], problem)},
     ]
 
 
@@ -424,13 +470,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Bare prompt + log baseline runner for Intern-S1 math tests"
     )
-    parser.add_argument("--input", "-i", required=True, help="Input JSON/JSONL/CSV/XLSX")
-    parser.add_argument("--output", "-o", required=True, help="Output JSONL path")
+    parser.add_argument("--input", "-i", default=None, help="Input JSON/JSONL/CSV/XLSX")
+    parser.add_argument(
+        "--output",
+        "-o",
+        default=None,
+        help="Output JSONL path. If omitted, a unique prompt run directory is created.",
+    )
     parser.add_argument("--log-dir", default=None, help="Per-problem log directory")
+    parser.add_argument("--run-root", default="outputs/prompt_runs", help="Root for auto run dirs")
+    parser.add_argument("--run-name", default=None, help="Optional name for auto run dirs")
     parser.add_argument("--model", default="intern-s1")
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--api-base", default=None)
-    parser.add_argument("--prompt", default="baseline_v0", choices=sorted(PROMPTS))
+    parser.add_argument(
+        "--prompt",
+        default="baseline_v0",
+        help=f"Built-in prompt name. Known: {', '.join(sorted(PROMPTS))}",
+    )
+    parser.add_argument("--prompt-file", default=None, help="TXT or JSON prompt template file")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--timeout", type=int, default=120)
@@ -441,19 +499,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    input_path = args.input or str(find_default_input())
     run_baseline(
-        input_path=args.input,
+        input_path=input_path,
         output_path=args.output,
         model=args.model,
         api_key=args.api_key,
         api_base=args.api_base,
         prompt_name=args.prompt,
+        prompt_file=args.prompt_file,
         log_dir=args.log_dir,
         limit=args.limit,
         resume=args.resume,
         timeout=args.timeout,
         max_retries=args.max_retries,
         temperature=args.temperature,
+        run_root=args.run_root,
+        run_name=args.run_name,
     )
 
 

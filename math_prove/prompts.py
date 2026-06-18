@@ -301,8 +301,13 @@ condition or pitfall in this problem.
 
 
 JSON_FIX_SYSTEM = """\
-You repair invalid JSON without changing the mathematical meaning.
-Output ONLY one valid JSON object. No markdown, no commentary.
+You are a precise JSON repair utility. Your ONLY task is to repair the invalid JSON structure provided in the invalid output, ensuring it conforms to the given Schema hint, while preserving the mathematical meaning of the content.
+
+CRITICAL RULES:
+1. You must output EXACTLY one valid JSON object.
+2. Absolutely NO conversational introduction, explanation, analysis of the error, or concluding commentary is allowed.
+3. Do not include markdown code fences (like ```json ... ```). Output the raw JSON text directly.
+4. If the invalid output contains a partial or malformed JSON object, complete it or repair its syntax.
 """
 
 
@@ -327,16 +332,21 @@ def verifier_rubric_for(domain: str) -> str:
     )
 
 
-def solve_system_for(domain: str) -> str:
+def solve_system_for(domain: str, override: Optional[str] = None) -> str:
     addendum = DOMAIN_SOLVE_ADDENDA.get(str(domain or "other"), "")
+    base = override if override is not None else SOLVE_SYSTEM
     if not addendum:
-        return SOLVE_SYSTEM
-    return SOLVE_SYSTEM + "\nDomain-specific system focus:\n" + addendum
+        return base
+    return base + "\nDomain-specific system focus:\n" + addendum
 
 
 def classification_messages(
-    problem: str, rule_prior: Optional[Dict[str, Any]] = None
+    problem: str,
+    rule_prior: Optional[Dict[str, Any]] = None,
+    variant_overrides: Optional[Dict[str, Optional[str]]] = None,
 ) -> List[Dict[str, str]]:
+    overrides = variant_overrides or {}
+    system_prompt = overrides.get("classify") or CLASSIFY_SYSTEM
     prior_text = ""
     if rule_prior:
         prior_text = (
@@ -347,7 +357,7 @@ def classification_messages(
             "or tool_policy."
         )
     return [
-        {"role": "system", "content": CLASSIFY_SYSTEM},
+        {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": (
@@ -372,8 +382,11 @@ def solve_messages(
     classification: Dict[str, Any],
     attempt: int,
     previous_feedback: Optional[str] = None,
+    variant_overrides: Optional[Dict[str, Optional[str]]] = None,
 ) -> List[Dict[str, str]]:
+    overrides = variant_overrides or {}
     domain = str(classification.get("domain", "other"))
+    system_prompt = solve_system_for(domain, override=overrides.get("solve"))
     style = "primary method"
     if attempt == 2:
         style = "alternative method; do not repeat the first reasoning path"
@@ -382,7 +395,7 @@ def solve_messages(
 
     feedback = previous_feedback or "No previous feedback."
     return [
-        {"role": "system", "content": solve_system_for(domain)},
+        {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": (
@@ -407,10 +420,13 @@ def verify_messages(
     classification: Dict[str, Any],
     candidate: Dict[str, Any],
     tool_result: Optional[Dict[str, Any]] = None,
+    variant_overrides: Optional[Dict[str, Optional[str]]] = None,
 ) -> List[Dict[str, str]]:
+    overrides = variant_overrides or {}
+    system_prompt = overrides.get("verify") or VERIFY_SYSTEM
     domain = str(classification.get("domain", "other"))
     return [
-        {"role": "system", "content": VERIFY_SYSTEM},
+        {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": (
@@ -432,9 +448,12 @@ def select_messages(
     problem: str,
     classification: Dict[str, Any],
     candidates: Iterable[Dict[str, Any]],
+    variant_overrides: Optional[Dict[str, Optional[str]]] = None,
 ) -> List[Dict[str, str]]:
+    overrides = variant_overrides or {}
+    system_prompt = overrides.get("select") or SELECT_SYSTEM
     return [
-        {"role": "system", "content": SELECT_SYSTEM},
+        {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": (
@@ -453,9 +472,12 @@ def extract_messages(
     classification: Dict[str, Any],
     candidate: Dict[str, Any],
     verification: Dict[str, Any],
+    variant_overrides: Optional[Dict[str, Optional[str]]] = None,
 ) -> List[Dict[str, str]]:
+    overrides = variant_overrides or {}
+    system_prompt = overrides.get("extract") or EXTRACT_SYSTEM
     return [
-        {"role": "system", "content": EXTRACT_SYSTEM},
+        {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": (
@@ -470,6 +492,9 @@ def extract_messages(
 
 
 def json_fix_messages(raw_text: str, error: str, schema_hint: str) -> List[Dict[str, str]]:
+    truncated_raw = str(raw_text or "").strip()
+    if len(truncated_raw) > 2000:
+        truncated_raw = "... [truncated reasoning trace] ...\n" + truncated_raw[-2000:]
     return [
         {"role": "system", "content": JSON_FIX_SYSTEM},
         {
@@ -477,7 +502,7 @@ def json_fix_messages(raw_text: str, error: str, schema_hint: str) -> List[Dict[
             "content": (
                 f"Schema hint:\n{schema_hint}\n\n"
                 f"Parser error:\n{error}\n\n"
-                f"Invalid output:\n{raw_text}"
+                f"Invalid output:\n{truncated_raw}"
             ),
         },
     ]

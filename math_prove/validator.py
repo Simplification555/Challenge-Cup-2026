@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import warnings
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -24,22 +25,22 @@ LOW_QUALITY_ANSWER_PATTERNS = (
     "cannot solve",
     "can't solve",
     "unknown",
-    "无法",
-    "不能确定",
-    "不确定",
-    "不会",
+    "\u65e0\u6cd5",
+    "\u4e0d\u80fd\u786e\u5b9a",
+    "\u4e0d\u786e\u5b9a",
+    "\u4e0d\u4f1a",
 )
 
 MOJIBAKE_MARKERS = (
     "\ufffd",
-    "Ã",
-    "â",
-    "鈥",
-    "涓",
-    "鐨",
-    "棰",
-    "瑙",
-    "鍒",
+    "\u00c3",
+    "\u00e2",
+    "\u920d",
+    "\u951b",
+    "\u6d93",
+    "\u95ab",
+    "\u5982",
+    "\u941f",
 )
 
 
@@ -49,6 +50,10 @@ class ValidationItem:
     schema_valid: bool
     preflight_passed: bool = True
     log_present: Optional[bool] = None
+    expected_answer_form: str = ""
+    expected_task_type: str = ""
+    expected_verification_type: str = ""
+    needs_llm_judge: bool = False
     answer_equivalent: Optional[bool] = None
     equivalence_method: str = ""
     llm_judge_correct: Optional[bool] = None
@@ -72,6 +77,7 @@ class ValidationReport:
     missing_expected_ids: List[str] = field(default_factory=list)
     extra_result_ids: List[str] = field(default_factory=list)
     log_missing_count: int = 0
+    needs_llm_judge_count: int = 0
     answer_checked: int = 0
     answer_correct: int = 0
     answer_incorrect: int = 0
@@ -81,6 +87,26 @@ class ValidationReport:
     items: List[ValidationItem] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
+        local_accuracy = (
+            self.answer_correct / self.answer_checked if self.answer_checked else None
+        )
+        llm_accuracy = (
+            self.llm_judge_correct / self.llm_judge_checked
+            if self.llm_judge_checked
+            else None
+        )
+        if self.llm_judge_checked:
+            official_like_checked = self.llm_judge_checked
+            official_like_correct = self.llm_judge_correct
+            official_like_incorrect = self.llm_judge_incorrect
+            official_like_source = "llm_judge"
+            official_like_accuracy = llm_accuracy
+        else:
+            official_like_checked = self.answer_checked
+            official_like_correct = self.answer_correct
+            official_like_incorrect = self.answer_incorrect
+            official_like_source = "local_equivalence_fallback"
+            official_like_accuracy = local_accuracy
         return {
             "total": self.total,
             "schema_valid": self.schema_valid,
@@ -90,21 +116,22 @@ class ValidationReport:
             "missing_expected_ids": self.missing_expected_ids,
             "extra_result_ids": self.extra_result_ids,
             "log_missing_count": self.log_missing_count,
+            "needs_llm_judge_count": self.needs_llm_judge_count,
             "answer_checked": self.answer_checked,
             "answer_correct": self.answer_correct,
             "answer_incorrect": self.answer_incorrect,
             "llm_judge_checked": self.llm_judge_checked,
             "llm_judge_correct": self.llm_judge_correct,
             "llm_judge_incorrect": self.llm_judge_incorrect,
+            "official_like_checked": official_like_checked,
+            "official_like_correct": official_like_correct,
+            "official_like_incorrect": official_like_incorrect,
+            "official_like_accuracy_source": official_like_source,
             "schema_valid_rate": self.schema_valid / self.total if self.total else 0.0,
-            "answer_accuracy": (
-                self.answer_correct / self.answer_checked if self.answer_checked else None
-            ),
-            "llm_judge_accuracy": (
-                self.llm_judge_correct / self.llm_judge_checked
-                if self.llm_judge_checked
-                else None
-            ),
+            "answer_accuracy": local_accuracy,
+            "local_equivalence_accuracy": local_accuracy,
+            "llm_judge_accuracy": llm_accuracy,
+            "official_like_accuracy": official_like_accuracy,
             "items": [item.to_dict() for item in self.items],
         }
 
@@ -138,30 +165,40 @@ class _GenericLLM:
         self.timeout = timeout
 
     def chat(self, messages: List[Dict[str, str]]) -> str:
-        data: Dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "n": 1,
-            "temperature": 0.0,
-            "max_tokens": 2048,
-            "response_format": {"type": "json_object"},
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
-        resp = requests.post(
-            self.url, headers=headers, data=json.dumps(data), timeout=self.timeout
-        )
-        body = resp.json()
-        if "choices" in body:
-            return str(body["choices"][0]["message"]["content"])
-        if "error" in body:
-            msg = str(body["error"].get("message", body["error"]))
-            if "response_format" in msg.lower() or "json_object" in msg.lower():
+        try:
+            data: Dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "n": 1,
+                "temperature": 0.0,
+                "max_tokens": 2048,
+                "response_format": {"type": "json_object"},
+            }
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            }
+            resp = requests.post(
+                self.url, headers=headers, data=json.dumps(data), timeout=self.timeout
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            if "choices" in body and body["choices"]:
+                content = body["choices"][0]["message"]["content"]
+                if content and content.strip():
+                    return str(content)
+            if "error" in body:
+                msg = str(body["error"].get("message", body["error"]))
+                if "response_format" in msg.lower() or "json_object" in msg.lower():
+                    return self._chat_no_json_mode(messages)
+                raise RuntimeError(msg)
+        except Exception:
+            try:
                 return self._chat_no_json_mode(messages)
-            raise RuntimeError(msg)
-        raise RuntimeError(resp.text[:200])
+            except Exception as e:
+                raise RuntimeError(f"JSON-mode call and fallback call both failed. Fallback error: {e}")
+
+        return self._chat_no_json_mode(messages)
 
     def _chat_no_json_mode(self, messages: List[Dict[str, str]]) -> str:
         data: Dict[str, Any] = {
@@ -178,25 +215,29 @@ class _GenericLLM:
         resp = requests.post(
             self.url, headers=headers, data=json.dumps(data), timeout=self.timeout
         )
+        resp.raise_for_status()
         body = resp.json()
-        if "choices" in body:
-            return str(body["choices"][0]["message"]["content"])
+        if "choices" in body and body["choices"]:
+            content = body["choices"][0]["message"]["content"]
+            if content is not None:
+                return str(content)
         raise RuntimeError(str(body.get("error", body)))
 
 
 JUDGE_SYSTEM_PROMPT = (
     "You are a math grader for the Intern-S math reasoning challenge.\n\n"
     "You receive:\n"
-    "1. problem — the math problem statement\n"
-    "2. reference_answer — ground truth; may be a final expression, a numeric value, or a proof/solution sketch\n"
-    "3. candidate_final_answer — the agent's submitted final answer\n"
-    "4. candidate_solution_process — the agent's reasoning_summary, key_steps, and learning_hint\n\n"
+    "1. problem: the math problem statement\n"
+    "2. answer_type: expected answer category, such as numeric, formula, proof, set, vector, or matrix\n"
+    "3. reference_answer: ground truth; may be a final expression, a numeric value, or a proof/solution sketch\n"
+    "4. candidate_final_answer: the agent's submitted final answer\n"
+    "5. candidate_solution_process: the agent's reasoning_summary, key_steps, and learning_hint\n\n"
     "Grade strictly. Consider:\n"
     "- Is the candidate's final answer mathematically equivalent to the reference?\n"
     "- Is the solution process logically valid and consistent with the final answer?\n"
     "- For proof problems: does the reasoning actually establish the claim, or merely restate it?\n\n"
     "Be lenient on superficial formatting (LaTeX vs plain text, bracket styles, whitespace, Unicode).\n\n"
-    "Return JSON only with keys: correct (bool), confidence (0.0-1.0), reason (string, ≤500 chars)."
+    "Return JSON only with keys: correct (bool), confidence (0.0-1.0), reason (string, <=500 chars)."
 )
 
 
@@ -307,8 +348,21 @@ def validate_results(
         exp = expected.get(solution.problem_id)
         if exp is not None:
             expected_answer = exp.get("expected_answer", exp.get("answer"))
-            answer_type = str(exp.get("answer_type") or solution.answer_type or "other")
-            eq = equivalent_answers(solution.answer, expected_answer, answer_type)
+            item.expected_answer_form = str(exp.get("answer_form") or "")
+            item.expected_task_type = _stringify_metadata(exp.get("task_type"))
+            item.expected_verification_type = _stringify_metadata(exp.get("verification_type"))
+            answer_type = str(
+                exp.get("answer_type")
+                or solution.answer_type
+                or exp.get("answer_form")
+                or "other"
+            )
+            item.needs_llm_judge = _needs_llm_judge(exp, answer_type)
+            if item.needs_llm_judge:
+                report.needs_llm_judge_count += 1
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SyntaxWarning)
+                eq = equivalent_answers(solution.answer, expected_answer, answer_type)
             item.answer_equivalent = eq.equivalent
             item.equivalence_method = eq.method
             report.answer_checked += 1
@@ -353,10 +407,10 @@ def validate_results(
 
         # Progress
         if llm_judge and llm_judge.enabled:
-            jc = "✓" if item.llm_judge_correct else ("?" if item.llm_judge_correct is None else "✗")
+            jc = "Y" if item.llm_judge_correct else ("?" if item.llm_judge_correct is None else "N")
         else:
-            jc = "✓" if item.answer_equivalent else "✗"
-        print(f"  [{index}/{report.total}] {pid}  local={'✓' if item.answer_equivalent else '✗'}  judge={jc}")
+            jc = "Y" if item.answer_equivalent else "N"
+        print(f"  [{index}/{report.total}] {pid}  local={'Y' if item.answer_equivalent else 'N'}  judge={jc}")
 
         report.items.append(item)
 
@@ -369,6 +423,7 @@ def _call_one_judge(
     expected_answer: Any,
     solution_process: Optional[Dict[str, Any]],
     llm: _GenericLLM,
+    answer_type: str = "other",
 ) -> Optional[Dict[str, Any]]:
     """Call a single judge model, returning its verdict or None on error.
 
@@ -383,6 +438,7 @@ def _call_one_judge(
             "content": json.dumps(
                 {
                     "problem": problem,
+                    "answer_type": str(answer_type or "other"),
                     "reference_answer": str(expected_answer or ""),
                     "candidate_final_answer": str(prediction or ""),
                     "candidate_solution_process": solution_process or {},
@@ -415,8 +471,9 @@ def _multi_judge(
     solution_process: Optional[Dict[str, Any]],
     config: LLMJudgeConfig,
     local_equivalent: bool = False,
+    answer_type: str = "other",
 ) -> Dict[str, Any]:
-    """Judge with local equivalence shortcut + optional multi-model voting."""
+    """Judge with local equivalence shortcut + optional single or multi-model voting."""
     if local_equivalent and not config.judge_all:
         return {
             "correct": True,
@@ -440,14 +497,43 @@ def _multi_judge(
 
     results: List[Optional[Dict[str, Any]]] = []
     for llm in llms:
-        results.append(_call_one_judge(problem, prediction, expected_answer, solution_process, llm))
+        results.append(
+            _call_one_judge(
+                problem,
+                prediction,
+                expected_answer,
+                solution_process,
+                llm,
+                answer_type=answer_type,
+            )
+        )
 
-    correct_votes = sum(1 for r in results if r is not None and r["correct"])
-    valid = sum(1 for r in results if r is not None)
+    valid_results = [r for r in results if r is not None]
+    if not valid_results:
+        return {
+            "correct": None,
+            "confidence": 0.0,
+            "reason": "All LLM judge calls failed.",
+            "method": "judge_failed",
+        }
+
+    # If we have only 1 judge, we do not vote, we just use the single judge result
+    if len(llms) == 1:
+        single_res = valid_results[0]
+        return {
+            "correct": single_res["correct"],
+            "confidence": single_res["confidence"],
+            "reason": single_res["reason"],
+            "method": f"single_judge:{config.judges[0]['model']}",
+        }
+
+    # Multi-judge voting
+    correct_votes = sum(1 for r in valid_results if r["correct"])
+    valid = len(valid_results)
     passed = correct_votes > valid / 2 if valid > 0 else False
-    confidences = [r["confidence"] for r in results if r is not None]
+    confidences = [r["confidence"] for r in valid_results]
     avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
-    reasons = [r["reason"] for r in results if r is not None and r["reason"]]
+    reasons = [r["reason"] for r in valid_results if r["reason"]]
     models_used = [j["model"] for j in config.judges]
 
     individual = []
@@ -483,7 +569,15 @@ def judge_answer_with_llm(
     local_equivalent: bool = False,
     solution_process: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return _multi_judge(problem, prediction, expected, solution_process, config, local_equivalent)
+    return _multi_judge(
+        problem,
+        prediction,
+        expected,
+        solution_process,
+        config,
+        local_equivalent,
+        answer_type=answer_type,
+    )
 
 
 def _parse_judge_json(text: str) -> Dict[str, Any]:
@@ -509,6 +603,35 @@ def _clamp_float(value: Any) -> float:
 
 def _row_problem_id(row: Dict[str, Any], index: int) -> str:
     return str(row.get("problem_id") or row.get("id") or f"row_{index}").strip()
+
+
+def _stringify_metadata(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _needs_llm_judge(expected_row: Dict[str, Any], answer_type: str) -> bool:
+    signals = [
+        answer_type,
+        expected_row.get("answer_form"),
+        expected_row.get("task_type"),
+        expected_row.get("verification_type"),
+    ]
+    text = " ".join(_stringify_metadata(signal).lower() for signal in signals)
+    return any(
+        marker in text
+        for marker in (
+            "llm_judge",
+            "manual_review",
+            "theorem_check",
+            "proof",
+            "prove",
+            "model_solution",
+        )
+    )
 
 
 def _safe_log_name(problem_id: str) -> str:
